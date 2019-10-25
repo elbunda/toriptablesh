@@ -1,0 +1,232 @@
+#!/bin/bash
+
+readonly FGRED="\e[31m"
+readonly FGGREEN="\e[32m"
+readonly STYLEBOLD="\e[1m"
+readonly STYLENORMAL="\e[0m"
+
+readonly NAME="toriptablesh"
+
+# Begin main
+main () {
+    default_dns_port="53"
+    local_dns_port="5353"
+    virtual_net_addr="10.0.0.0/10"
+    loopback="127.0.0.1"
+
+    tor_no_forward=(
+        "192.168.0.0/16"
+        "172.16.0.0/12"
+        "127.0.0.0/9"
+        "127.128.0.0/10"
+        "127.0.0.0/8"
+    ) 
+
+    tor_uid=$(get_tor_uid)
+    trans_port="9040"
+    torrc="/etc/tor/torrc"
+
+    cmd_opt="$1"
+
+    case "${cmd_opt}" in
+
+        -l|--load)
+            load
+            ;;
+        -f|--flush)
+            flush
+            ;;
+        -h|--help)
+            print_help
+            ;;
+        *)
+            print_help
+    esac
+
+}
+
+print_error () {
+    msg="$1"
+    echo -e "[ ${FGRED}!!!${STYLENORMAL} ] ${msg}"
+    exit 1
+}
+
+print_info () {
+    msg="$1"
+    echo -e "[ ${FGGREEN}***${STYLENORMAL} ] ${msg}"
+}
+
+print_help () {
+    echo -e ""
+    echo -e "toriptablesh.sh"
+    echo -e ""
+    echo -e "Usage: toriptablesh.sh [option]"
+    echo -e "   -l  --load      Load iptables rules"
+    echo -e "   -f  --flush     Remove iptables rules"
+    echo -e "   -h  --help      Show this help"
+}
+
+get_tor_uid () {
+    ids=("tor" "debian-tor")
+    for uid in "${ids[@]}"; do
+        if id -u "${uid}" > /dev/null 2>&1; then
+            echo "${uid}"
+            return
+        fi
+    done
+
+    print_error "Tor user not found"
+}
+
+mod_config () {
+    torrc_iptables_rules=$( cat <<-END
+## DO NOT MODIFY!!
+## Inserted by ${NAME} for Tor iptables rules
+## Transparently route all traffic through Tor on port ${trans_port}
+VirtualAddrNetwork ${virtual_net_addr}
+AutomapHostsOnResolve 1
+TransPort ${trans_port} 
+DNSPort ${local_dns_port} 
+END
+    )
+
+    grep "^## Inserted by ${NAME} for Tor iptables rules" "${torrc}" > /dev/null 2>&1
+
+    if ! [ $? -eq 0 ]; then
+        print_info "Writing new configuration"
+        cat "${torrc_iptables_rules}" > "${torrc}"
+    fi
+}
+
+get_init () {
+
+    inits=("rc-service" "systemctl")
+
+    for i in "${inits[@]}"; do
+        if [ -x "$(command -v ${i})" ]; then
+            echo "${i}"
+            return
+        fi
+    done
+}
+
+restart_tor () {
+
+    local init=$(get_init)
+
+    case "${init}" in
+        "rc-service")
+            rc-service tor restart
+            ;;
+        "systemctl")
+            systemctl restart tor
+            ;;
+        *)
+            print_error "Unsupported init"
+            ;;
+    esac
+
+    if ! [ $? -eq 0 ]; then
+        print_error "Could not restart tor service"
+    fi
+
+}
+
+load_iptables_rules () {
+
+    iptables -I OUTPUT ! -o lo ! -d \
+        ${loopback} ! -s ${loopback} -p tcp \
+        -m tcp --tcp-flags ACK,FIN ACK,FIN \
+        -j DROP
+
+    iptables -I OUTPUT ! -o lo ! -d \
+        ${loopback} ! -s ${loopback} -p tcp \
+        -m tcp --tcp-flags ACK,RST ACK,RST \
+        -j DROP
+
+    iptables -t nat -A OUTPUT -m owner \
+        --uid-owner ${tor_uid} \
+        -j RETURN
+
+    iptables -t nat -A OUTPUT -p udp \
+        --dport ${default_dns_port} \
+        -j REDIRECT --to-ports ${local_dns_port}
+    
+    for subnet in "${tor_no_forward[@]}"; do
+        iptables -t nat -A OUTPUT -d "${subnet}" \
+            -j RETURN
+    done
+
+    iptables -t nat -A OUTPUT -p tcp --syn \
+        -j REDIRECT --to-ports ${trans_port}
+
+    iptables -A OUTPUT -m state \
+        --state ESTABLISHED,RELATED \
+        -j ACCEPT
+
+    for subnet in "${tor_no_forward[@]}"; do
+        iptables -A OUTPUT -d "${subnet}" \
+            -j ACCEPT
+    done
+
+    iptables -A OUTPUT -m owner --uid-owner ${tor_uid} \
+        -j ACCEPT
+
+    iptables -A OUTPUT -j REJECT
+}
+
+flush_iptables_rules () {
+    iptables -F
+    iptables -t nat -F
+
+}
+
+load () {
+
+    print_info "Starting tor service"
+    restart_tor
+
+    print_info "Loading iptables rules"
+    load_iptables_rules
+
+    print_info "Getting public IP"
+
+    sleep 2
+
+    ip_address=$(check_tor_connect)
+
+    if ! [ "x${ip_address}" = "xerror" ]; then
+        print_info "Your IP address is ${FGGREEN}${ip_address}${STYLENORMAL}"
+    else
+        print_error "Could not obtain IP address"
+    fi
+
+    echo -e "[ ${FGGREEN}ON${STYLENORMAL}  ] toriptablesh"
+}
+
+flush () {
+    print_info "Flushing iptables"
+    flush_iptables_rules
+
+    echo -e "[ ${FGRED}OFF${STYLENORMAL} ] toriptablesh"
+}
+
+check_tor_connect () {
+    readonly URL_TOR_CHECK="https://wtfismyip.com/text"
+
+    for i in 0..20; do
+
+        ip_address=$(curl -s "${URL_TOR_CHECK}")
+        
+        if [ $? -eq 0 ]; then
+            echo "${ip_address}"
+            return
+        fi
+
+        sleep 2
+    done
+
+    echo "error"
+}
+
+main "$@"
